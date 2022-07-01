@@ -1,794 +1,637 @@
-
-/* PCCGrid This is the base Grid for all of Payment Control.
-This has the basic grid functionality including these features:
-  - Paging
-  - Printing Grid
-  - Exporting Grid
-  - Selecting Rows
- */
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import styled from "styled-components";
-import {DataGrid} from "@jpmuitk/data-grid";
+import React, {useEffect, useMemo, useState} from "react";
+import {useTranslation} from "react-i18next";
+import {ColDef, ColumnState, GridApi, GridOptions, RowNode} from "ag-grid-community";
+import {ColumnLayout} from '@jpmuitk/column-layout';
+import AlertsBanner, {BannerDisplayTypes, IBannerOptions} from "../../components/AlertsBanner";
+import {Panel} from '@jpmuitk/panel';
+import {IAlertData, ISelectedAlerts, SecurityCenterMessages, StatusTypes} from "../../store/pymtFraud/fraudTypes";
+import {IApplicationState} from "../../store/types";
 import {useDispatch, useSelector} from "react-redux";
 import * as _ from "lodash";
-import {updateActiveGridStatus, updateSelectedRows} from "../../store/pcc/actions";
-import {IExportProps} from "../../store/pymtFraud/fraudTypes";
-import {IApplicationState} from "../../store/types";
-import {createStyles, Theme, withStyles} from "@jpmuitk/theme";
-import classnames from "classnames";
-import {
-  ColDef, ColumnApi, ColumnState, DragStoppedEvent,
-  ExportParams,
-  GridApi,
-  GridOptions,
-  ProcessCellForExportParams,
-  ProcessRowGroupForExportParams,
-  RowNode,
-  SelectionChangedEvent,
-} from "ag-grid-community";
+import GridTools, {ToolGridActionTypes} from "../../components/grid/GridTools";
+import FlyoutPanel from "../../components/flyout/FlyoutPanel";
+import ActionsToolbar, {
+  IDisabledActions,
+  ToolbarActionTypes,
+  ToolbarSelectionState} from "../../actions/ActionsToolbar";
+import styled from "styled-components";
+import FilterGrid from "./grid/FilterGrid";
+import {changeDetailsPanelStatus, submitAlertsReset, updateSelectionCounts} from "../../store/pymtFraud/fraudActions";
+import { findAlert, isStatusEditable, isStatusPendingSubmit} from "../../utils/Utilities";
+import {getTransactionColumns, ITEMSFORREVIEWCOLUMNS} from "./Columns";
+import {createStyles} from "@material-ui/core";
+import {withStyles} from "@jpmuitk/theme";
+import {changeSelectedAlertStatus, loadPayments} from "../../store/pymtFraud/fraudEffects";
+import {IUserPreferences, LocalStorageName, PCCTabs} from "../../store/pcc/pccTypes";
+import SubmitActionManager from './dialog/SubmitActionManager';
+import FlyoutHeader from "../../components/flyout/FlyoutHeader";
+import AlertsHeaderDetails from "../flyout/AlertsHeaderDetails";
+import FlyoutContent from "../../components/flyout/FlyoutContent";
+import DataDetail from "../../components/DataDetail";
+import {changeFlyoutRecord, exportFlyoutComplete} from "../../store/pcc/actions";
+import {createMetadata, exportFlyoutData} from "../flyout/FlyoutUtils";
+import {GridExportTypes} from "../../components/grid/PCCGrid";
+import {PCCTitleBox} from "../styles";
 
-import CustomLoadingOverlay from "./CustomLoadingOverlay";
-import CustomNoRowsOverlay, {INoRowsOverlay} from "./CustomNoRowsOverlay";
-import CustomPagingDisplay from "./CustomPagingDisplay";
-import DecisionDetailCellRenderer from "../../fraud/alerts/grid/columnFormatters/DecisionDetailCellRenderer";
-import {exportGridComplete, printGridComplete} from "../../store/pcc/actions";
-import {useTranslation} from 'react-i18next';
-import {LocalStorageName, PCCMessages} from "../../store/pcc/pccTypes";
-import {getCustomContentBelowRow, processCellCallback} from './gridUtils';
-
-export enum GridExportTypes {
-  CSV = 'csv',
-  XLS = 'xls'
-}
-
-export enum GridDensity {
-  LOW = 'low',
-  HIGH = 'high'
-}
-
-export enum PccRowSelection {
-  NONE='none',
-  SINGLE= 'single',
-  MULTIPLE = 'multiple'
-}
-
-export interface INoRowsParams {
-  title?: string;
-  message: string;
-  actionButtonLabel?: string;
-  noDataCallback?: () => void;
-}
-
-interface IPCCGridGridProps {
-  gridOptions: GridOptions;
-  className?: string;
-  searchFilter?: string;
-  filterValue?: any;
-  rowSelection?: string;
-  pagination?: boolean;
-  reloadDataCallback?: () => void;
-  noFilterCheck?: (filterValue: any) => boolean;
-  gridFilter?: (node: RowNode, filterValue: any) => boolean;
-  rowUpdateCallback?: (api: GridApi) => void;
-  onGridReady?: (params: any) => void;
-  nestedGridProperty?: string;
-  nestedGridColumns?: ColDef[];
-  noRowsParams?: INoRowsParams;
-  message?: string;
-  loading?: boolean;
-  resizeCheck?: boolean;
-  timelyRefresh?: boolean;
+interface IAlertsProps {
   classes: {
-    pccGrid: any;
-    dataGridPrint: any;
-  };
-  localStorageName?: LocalStorageName;
+    drawerOpen: string;
+  }
 }
 
-const excelStyles: any[] = [
-  {
-    id: 'header',
-    font: {
-      bold: true
-    }
-  },
-  {
-    id: 'stringType',
-    dataType: 'String'
-  },
-  {
-    id: 'twoDecimalPlaces',
-    numberFormat: {
-      format: '#,##0.00'
-    }
-  }];
-
-
-const PCCGrid: React.FC<IPCCGridGridProps> = props => {
+const Alerts: React.FC<IAlertsProps> = ()  => {
 
   const {t} = useTranslation();
-  const userPreferences = useSelector( (state: IApplicationState) => state.pcc.preferences.userPrefs);
   const dispatch = useDispatch();
-// TODO: consider using:   const gridOptions = props.gridOptions;
-  const nestProp = props.nestedGridProperty;
-  const nestColumns = props.nestedGridColumns;
+  /*------------------------Section: variables -----------------------------*/
+  /*------------------------Section: useStates -----------------------------*/
+  const [disableGridToolsNoData, setdisableGridToolsNoData] = useState(true);
+  const [showBanner, setBanner] = useState(false);
+  const [refreshFilters, setRefreshFilters] = useState(false); // flag to manually update filters
+  const [refreshFlag, setRefreshFlag] = useState(false);// flag if manual refresh triggered
+  const [isSubmitClicked, setIsSubmitClicked] = useState(false);
 
+  /*------------------------Section: useSelectors -----------------------------*/
+  const userPreferences: IUserPreferences = useSelector( (state: IApplicationState) => state.pcc.preferences.userPrefs);
 
-  const defaultColDef= useMemo( () => {
-    return {
-      flex: 1,
-      editable: false,
-      sortable: true,
-      filter: true,
-      suppressMenu: false
-    }
-  },[]);
+  const currentTab: PCCTabs = useSelector((state: IApplicationState) => state.pcc.currentTab);
 
-  const [gridApi, setGridApi] = useState<GridApi | null>(null);
-  const [columnApi, setColumnApi] = useState(null);
-  const [gridOptions, setGridOptions] = useState(props.gridOptions);
-  const [dataLoaded, setDataLoaded] = useState(false)
-  const [dataInFilter, setDataInFilter] = useState(false);
-  const [updateTimeInterval, setUpdateTimeInterval] = useState<NodeJS.Timeout | null>();
-  const [overlayTimeout, setOverlayTimeout] = useState<NodeJS.Timeout | null>();
-  // work around for filter value as state is not updated in Grid Filter Functions
-  // From what is seen, PCCGrid.tsx does not recognize the new props.filterValue when
-  // it changes and useRef was created as a work around. This may need to be rewritten
-  // as there might be a better way that doesn't rely on useRef.
-  const gFilter = useRef(props.filterValue);
-  const [gridDensity, setGridDensity] = useState<any>(GridDensity.LOW);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [updateSelectedRowsData, setUpdateSelectedRowsData] = useState<boolean>(false);
-  const [selRowNodes, setSelectedRowNodes] = useState<any[]>([]);
+  const loadingAlerts:boolean = useSelector((state: IApplicationState) =>
+    state.fraud.alerts.loading.loadingAlerts);
 
-  const status: string = useSelector((state: IApplicationState) =>  state.pcc.activeGrid.status);
-  const printGrid: boolean = useSelector( (state: IApplicationState) => state.pcc.activeGrid.loading.gridPrinting);
-  const exportGrid: IExportProps = useSelector( (state: IApplicationState) => {
-    return {
-      gridExporting: state.pcc.activeGrid.loading.gridExporting,
-      type: state.pcc.exportType
-    };
+  const alertsData:IAlertData[] = useSelector((state: IApplicationState) => state.fraud.alerts.alertsData);
+
+  const alertsMsg:string = useSelector((state: IApplicationState) => state.fraud.alerts.message);
+
+  const selectedAlerts:ISelectedAlerts[] = useSelector((state: IApplicationState) =>
+    state.pcc.activeGrid.selectedRows);
+
+  const detailsPanelOpen:boolean = useSelector((state: IApplicationState) => state.fraud.alerts.detailsPanelOpen);
+
+  const currentRecord: any = useSelector((state: IApplicationState) => {
+    return state.pcc.flyout.currentRecord;
   });
 
-  const  frameworkComponents = useMemo( () => {
-    return {
-      customLoadingOverlay: CustomLoadingOverlay,
-      customNoRowsOverlay: CustomNoRowsOverlay,
-      customPagingDisplay : CustomPagingDisplay,
-      decisionDetailCellRenderer: DecisionDetailCellRenderer
+  const environment:string = useSelector((state: IApplicationState) => state.pcc.appEnv.environment);
+
+  const isGridPrinting:boolean = useSelector((state: IApplicationState) => {
+    return state.pcc.activeGrid.loading.gridPrinting;
+  });
+
+  const submitStatus = useSelector( (state: IApplicationState) => state.fraud.alerts.submitStatus);
+
+  const disabledActions: IDisabledActions = useSelector( (store: IApplicationState) => {
+    const disabledBtns: any = {};
+    const selAlerts = store.pcc.activeGrid.selectedRows;
+    const flyoutOpen = store.fraud.alerts.detailsPanelOpen;
+    disabledBtns[ToolbarActionTypes.SUBMIT] = (flyoutOpen || store.fraud.alerts.pendingSubmitData.length === 0);
+    disabledBtns[ToolbarActionTypes.REMOVE] = (flyoutOpen || !selAlerts.length ||
+      store.fraud.alerts.counts.pendingUserChange !== selAlerts.length )
+    disabledBtns[ToolbarActionTypes.VIEW] =  flyoutOpen || !selAlerts.length;
+    disabledBtns[ToolbarActionTypes.REJECT] = (flyoutOpen ||
+      store.fraud.alerts.counts.pendingBankCount !== selAlerts.length  || selAlerts.length === 0 );
+    disabledBtns[ToolbarActionTypes.APPROVE] = (flyoutOpen ||
+      store.fraud.alerts.counts.pendingBankCount !== selAlerts.length || selAlerts.length === 0 );
+    return disabledBtns;
+  });
+
+  const disableGridTools: boolean = useSelector((state: IApplicationState) => {
+    return state.fraud.alerts.alertsData.length === 0;
+  });
+
+  const bannerOptions: IBannerOptions = useSelector((state: IApplicationState) => {
+
+    const bannerOPT: IBannerOptions = {
+      type: state.fraud.alerts.submitStatus.status,
+      message: '',
+      persist: false
     }
+    if (state.fraud.alerts.submitStatus.totalCount !== 0 && state.fraud.alerts.submitStatus.status === BannerDisplayTypes.SUCCESS) {
+      let msg = "";
+      const alertStatus = state.fraud.alerts.submitStatus;
+      const localGroup = 'submitMessages';
+      const submittedMsg = (alertStatus.countSuccessful > 1) ? t(`${localGroup}.submitted.multiple`) : t(`${localGroup}.submitted.single`);
+      msg = `${alertStatus.totalCount} ${submittedMsg}`;
+
+      const oneManyStatus = (alertStatus.countSuccessful === 1) ? 'single' : 'multiple';
+      let localizedMsg = `${localGroup}.${'successfulSubmissions'}.${oneManyStatus}`;
+
+      if (alertStatus.suspectedFraud) {
+        const oneManyFraud = (alertStatus.suspectedFraud === 1) ? 'single' : 'multiple';
+        localizedMsg = `${localGroup}.${'successfulSubmissions'}.${oneManyFraud}.fraud`;
+        if (alertStatus.suspectedFraud === alertStatus.countSuccessful) {
+          // if ALL alerts selected were rejected for fraud adjust msg
+          localizedMsg = `${localGroup}.${'successfulSubmissions'}.${oneManyFraud}.allFraud`;
+          msg = `${alertStatus.suspectedFraud} ${t(localizedMsg)}`
+        } else {
+          msg += ` ${alertStatus.suspectedFraud} ${t(localizedMsg)}`
+        }
+      }
+
+      bannerOPT.message = msg;
+      bannerOPT.type = alertStatus.status;
+      // closeSubmit(true);
+    }
+
+    else if(state.pcc.activeGrid.headerSelected && state.fraud.alerts.counts.pendingBankDecisionCount > 0) {
+      bannerOPT.message = `${t('fraud.unusualActivity.HeaderMessage')}`;
+      bannerOPT.type = BannerDisplayTypes.INFO;
+
+    }
+    return bannerOPT;
+  });
+
+  /*------------------------Section: useMemos -----------------------------*/
+  const actionTools: ToolbarActionTypes[] = useMemo( () => {
+    return [
+      ToolbarActionTypes.VIEW,
+      ToolbarActionTypes.APPROVE,
+      ToolbarActionTypes.REJECT,
+      ToolbarActionTypes.REMOVE,
+      ToolbarActionTypes.SUBMIT
+    ]
+  },[]);
+  const flyoutActionTools: ToolbarActionTypes[] = useMemo( () => {
+    return [
+      ToolbarActionTypes.APPROVE,
+      ToolbarActionTypes.REJECT,
+      ToolbarActionTypes.REMOVE,
+      ToolbarActionTypes.SUBMIT
+    ]
   },[]);
 
-  const getNoRowsOverlayParams = (gridStatus: string) => {
+  const gridTools: ToolGridActionTypes[] = useMemo( () => {
+    return [
+      ToolGridActionTypes.EXPORT,
+      ToolGridActionTypes.REFRESH,
+      ToolGridActionTypes.HELP,
+      ToolGridActionTypes.PRINT
+    ]
+  },[]);
+
+  const disabledFlyoutActions: IDisabledActions = useSelector( (store: IApplicationState) => {
+    if (detailsPanelOpen) {
+      const disabledBtns: any = {};
+      const alert = store.pcc.flyout.currentRecord
+      disabledBtns[ToolbarActionTypes.SUBMIT] = alert !== null && !isStatusPendingSubmit((alert?.status as StatusTypes));
+      disabledBtns[ToolbarActionTypes.REMOVE] = (alert !== null && !isStatusPendingSubmit(alert?.status as StatusTypes))
+      disabledBtns[ToolbarActionTypes.REJECT] = (alert && (isStatusPendingSubmit(alert.status) || !isStatusEditable(alert.status)));
+      disabledBtns[ToolbarActionTypes.APPROVE] = (alert && (isStatusPendingSubmit(alert.status) || !isStatusEditable(alert.status)));
+      return disabledBtns;
+    }
+  });
+
+
+  // Function needed to make sure each filter is sorted by originalStatus first no matter what. originalStatus allows Decisioned/bolded transactions to
+  // appear at the top of the grid. Due to the user having the ability to move columns around, it is possible for originalStatus to not be in the first
+  // index. That is why there is a for loop that looks for original status and checks if it is not sorted by desc. The else if exists so when it does
+  // find originalStatus and finds out it is sorted by desc, it doesn't go through the rest of the array every time.
+
+  const postSort = () => {
+    if (gridOptions !== null && gridOptions !== undefined) {
+      const oldSortModel = gridOptions.columnApi?.getColumnState();
+      const columnDefs: ColDef[] | undefined = gridOptions.columnDefs;
+      if (columnDefs !== undefined) {
+        if (oldSortModel !== undefined && oldSortModel.length !== 0 && oldSortModel[0].colId !== undefined && oldSortModel[0].colId !== null) {
+          for (const column of oldSortModel) {
+            if (column.colId === ITEMSFORREVIEWCOLUMNS.ORIGINALSTATUS  && column.sort !== 'desc') {
+              column.sort = 'desc';
+              column.sortIndex = 0;
+
+              for (const column2 of oldSortModel) {
+                if (column2.colId !== ITEMSFORREVIEWCOLUMNS.ORIGINALSTATUS && column2.sort !== null && column2.sortIndex !== undefined &&  column2.sortIndex !== null) {
+                  column2.sortIndex +=1;
+                }
+
+              }
+              gridOptions.columnApi?.applyColumnState({
+                state: oldSortModel
+              })
+              break;
+            }
+            else if (column.colId === ITEMSFORREVIEWCOLUMNS.ORIGINALSTATUS && column.sort === 'desc') {
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const gridOptions: GridOptions = useMemo( () => {
     return {
-      status: gridStatus,
-      message: props.message as string,
-      noRowsParams: props.noRowsParams || null,
-      reloadData: () => {
-        setDataLoaded(false);
-        if (props.reloadDataCallback) {
-          props.reloadDataCallback();
+      defaultColDef: {
+        flex: 1,
+        editable: false,
+        sortable: true,
+        filter: true,
+        columnsMenuParams: {
+          suppressSyncLayoutWithGrid: false,
+          suppressColumnSelectAll: true
         }
-      }
+      },
+      suppressClickEdit: true,
+      animateRows: false,
+      postSort,
+      accentedSort: true, // to allow sorting by locale
+      getRowNodeId: (data: IAlertData) => {
+        return data.pccAlertKey.profileId + data.pccAlertKey.alertId + data.pccAlertKey.msgGuid;
+      },
+
+      columnDefs:  getTransactionColumns(t, userPreferences),
+      rowData: []
+    }
+  },[]);
+  /*------------------------Section: functions -----------------------------*/
+
+  const rowUpdateCallback = (api: GridApi) => {
+    if (api.getDisplayedRowCount() === 0) {
+      setdisableGridToolsNoData(true);
+    }
+    else if (api.getDisplayedRowCount() !== 0) {
+      setdisableGridToolsNoData(false);
     }
   }
 
-  const noRowsOverlayParams: INoRowsOverlay =  useMemo( () => getNoRowsOverlayParams(status),[status]);
+  const gridReloadCallback = () => {
+    // manual refresh called ==>  de-select rows, clear redux store of selected alerts and pending alerts,
+    // refresh data
+    gridOptions.api?.deselectAll();
+    toggleDetailsPanel(true);
+    dispatch(loadPayments(true));
+    dispatch(updateSelectionCounts( []));
+    setRefreshFlag(true);
+  }
 
 
-  const onPrint = useCallback(() => {
-    const api: any = gridApi;
-    const pageSize = api.paginationGetPageSize();
-    api.paginationSetPageSize(api.paginationGetTotalPages() * pageSize);
-    api.setDomLayout('print');
-    setGridDensity(GridDensity.HIGH);
 
-    // force the columns to fit the updated widths
-    (columnApi as any).sizeColumnsToFit(100);
+  const actionOnRecords = (actionType: ToolbarActionTypes, status?: string, record?: ISelectedAlerts) => {
+    const updatedData: IAlertData[] = [];
+    const checkAction = (alert : ISelectedAlerts | IAlertData) => {
+      let data: any = {};
+      switch (actionType) {
 
-    // print and then swap styles back after a delay to allow grid to settle
-    setTimeout(() => {
-      window.print();
+        case ToolbarActionTypes.APPROVE:
+          if (alert.status === StatusTypes.PENDING_DECISION || alert.status === StatusTypes.ST_PENDING) {
+            data = _.cloneDeep(alert);
+            data.originalStatus = data.status;
+            data.status = StatusTypes.ALERT_ACTION_APPROVE;
+          }
+          break;
 
-      setGridDensity(GridDensity.LOW)
-      dispatch(printGridComplete());
-      api.paginationSetPageSize(pageSize);
-      api.setDomLayout('');
-      api.sizeColumnsToFit();
-    }, 2000);
-  },[columnApi, gridApi, dispatch]);
+        case ToolbarActionTypes.REMOVE:
+          data = _.cloneDeep(alert);
+          data.status = data.originalStatus;
+          delete data.originalStatus; // delete property so original sort will resume
+          break;
 
-
-  const submitExportRequest = useCallback( (exportType: GridExportTypes, currData?: any[]) => {
-
-    if(gridOptions.api && columnApi) {
-
-      // Checks the number of selected rows after filter and sort and increments a counter for each one it finds.
-      let selectedRowsInCurrentFilter = 0;
-      gridOptions.api.forEachNodeAfterFilterAndSort((node: RowNode) => {
-        if (node.isSelected()) {
-          selectedRowsInCurrentFilter++;
-        }
-      });
-
-      // If the current grid has at least 1 selected row, export the selected row(s) in the current filtered
-      // grid. Otherwise, export the whole filtered grid.
-      const onlySelectedRows: boolean = (!currData) ? (selectedRowsInCurrentFilter !== 0) : false;
-      const exportParams: ExportParams<any> = {
-        onlySelected: onlySelectedRows,
-        processCellCallback: (cellParams: ProcessCellForExportParams) => processCellCallback(cellParams, userPreferences)
-      };
-      if (gridOptions.masterDetail) {
-        exportParams.getCustomContentBelowRow = (params: ProcessRowGroupForExportParams) =>
-          getCustomContentBelowRow(params, nestProp, nestColumns)
+        case ToolbarActionTypes.REJECT:
+          data = _.cloneDeep(alert);
+          data.originalStatus = data.status;
+          data.status = status;
+          break;
       }
 
-      if (exportType === GridExportTypes.XLS) {
-        gridOptions.api?.exportDataAsExcel(exportParams);
-      } else if (exportType === GridExportTypes.CSV) {
-        gridOptions.api?.exportDataAsCsv(exportParams);
+      return data
+    }
+    if (actionType === ToolbarActionTypes.SUBMIT) {
+      setIsSubmitClicked(true);
+    }
+    else if (actionType === ToolbarActionTypes.VIEW) {
+      dispatch(changeDetailsPanelStatus(true))
+    }
+    else if (record) {
+      updatedData.push(checkAction(record))
+      if (gridOptions && gridOptions.api) {
+        gridOptions.api.applyTransactionAsync({ update: updatedData },() => {
+          dispatch(changeSelectedAlertStatus(actionType, updatedData));
+        })
       }
 
-      // if masterDetail option used reset grid back to original state
-      if (props.gridOptions.masterDetail) {
-        props.gridOptions.rowData = currData;
-        setGridOptions(props.gridOptions);
-        // this will always run after the grid is loaded, filtered and sorted
-        gridOptions.api?.forEachNodeAfterFilterAndSort((node: RowNode) => {
-          const foundNode: any = selectedIds.includes(node.id as string);
-          if (foundNode) {
-            node.setSelected(true);
+    }
+    else if (gridOptions.api && !record) {
+      const gridApi: GridApi = gridOptions.api;
+
+      if (selectedAlerts.length) {
+        _.forEach(selectedAlerts, (selectedAlert: ISelectedAlerts | IAlertData) => {
+          if (selectedAlert) {
+           updatedData.push(checkAction(selectedAlert))
           }
         });
       }
-      dispatch(exportGridComplete());
-    }
-  },[columnApi, gridOptions, props.gridOptions, selectedIds, gridApi,dispatch]);
 
-  // Change in gridOptions Trigger
-  useEffect( () => {
-    if ( props.gridOptions && !exportGrid.gridExporting) {
-      props.gridOptions.onModelUpdated = (params: any) => {
-        if (!dataLoaded && params.newData === true) {
-          setDataLoaded(true);
-        }
-      }
-      props.gridOptions.excelStyles = excelStyles;
-      // props.gridOptions.suppressRowClickSelection=false;
-      const allDefaultCols = _.assign(props.gridOptions.defaultColDef || {}, defaultColDef);
-      props.gridOptions.defaultColDef =allDefaultCols;
-      props.gridOptions.suppressDragLeaveHidesColumns = true;
-        dispatch(updateActiveGridStatus(''));
-      setGridOptions(props.gridOptions);
-    }
-  }, [props.gridOptions, dataLoaded]);
-
-
-  // gridApi or Loading Trigger
-  useEffect( () => {
-
-    const api: GridApi = gridApi as unknown as GridApi;
-    if (api && dataLoaded && !props.loading && props.timelyRefresh && !updateTimeInterval) {
-       gridApi?.onFilterChanged();
-       gridApi?.onSortChanged();
-       const refreshIntrvl = setInterval(() => {
-        // tick down one minute from the timeToDecide count in seconds
-        const updatedTransactionData: any[] = [];
-        let gridSelectedNodes: RowNode[] = [];
-        const gridSelectedRows: any[] = [];
-         if (api != null) {
-           // Retrieving selected rows from grid not necessarily in user selected order
-           gridSelectedNodes = api.getSelectedNodes();
-           api.forEachNodeAfterFilterAndSort((node: any) => {
-             const newData: any = {...node.data};
-             newData.timeToDecide = newData.timeToDecide - 60;
-             updatedTransactionData.push(newData);
-             if(gridSelectedNodes.length > 0) {
-               // is node a selectedNode?
-               gridSelectedNodes.forEach( (selectedNode: RowNode) => {
-                 const updatedRowData = _.clone(selectedNode.data);
-                 if (node.id === selectedNode.id) {
-                   updatedRowData.timeToDecide = newData.timeToDecide;
-                   selectedNode.data = updatedRowData;
-                   gridSelectedRows.push(selectedNode);
-                 }
-               });
-             }
-           });
-           setSelectedRowNodes(gridSelectedRows);
-          api.applyTransactionAsync({ update: updatedTransactionData },
-            () => {
-              // Not using updatedSelectedRows since the gridApi rearranges the order based on grid
-              // Using setUpdateSelectedRowsData to execute useEffect to dispatch updateSelectedRows
-              // without resetting the timer
-              if(gridSelectedNodes.length) {
-                setUpdateSelectedRowsData(true);
-              }
-            });
-        }
-
-      }, 60 * 1000);
-      setUpdateTimeInterval(refreshIntrvl);
-       // run ever 60 seconds * 1000 milliseconds per second
-    }
-
-    // Clean up can be done like this
-    return() => {
-      if (updateTimeInterval) {
-        clearInterval(updateTimeInterval);
-        setUpdateTimeInterval(null);
-      }
-    }
-  },[gridApi, props.loading, dataLoaded, props.timelyRefresh, updateTimeInterval]);
-
-  // Using this useEffect to update selectedRows without resetting timer
-  // selRowNodes  ->  Incorrect order, updated data
-  // updatedSelectedAlertsData  ->  Correct order, updated data
-  useEffect(() => {
-    if(updateSelectedRowsData && selRowNodes.length) {
-      const updatedSelectedAlertsData: any[] = [];
-      selectedIds.forEach((id) => {
-        _.find(selRowNodes, (selNode) => {
-          if(selNode.id === id) {
-            updatedSelectedAlertsData.push(selNode.data);
+      // Apply updates for APPROVE, REMOVE or REJECT on grid
+      gridApi.applyTransactionAsync({update: updatedData},
+        () => {
+          // callback - once Grid has updated its status
+          dispatch(changeSelectedAlertStatus(actionType, updatedData));
+          // const api = gridOptions.api as GridApi;
+          if (gridApi) {
+            gridApi.deselectAll();
+            gridApi.paginationGoToFirstPage();
           }
-        })
-      });
-      setUpdateSelectedRowsData(false);
-      if(updatedSelectedAlertsData.length) {
-        dispatch(updateSelectedRows(updatedSelectedAlertsData, false));
-      }
-    }
-  }, [updateSelectedRowsData])
 
-  // loading trigger for overlays
-  useEffect( () => {
-    if (props.loading) {
-      dispatch(updateActiveGridStatus(''));
-    }
-   //  hideOrShowOverlay();
-    const ovrlyTimeout = setTimeout(() => {
-      hideOrShowOverlay();
-    }, 200)
-
-    setOverlayTimeout(ovrlyTimeout);
-
-    // Clean up of setTimeout
-    return () => {
-      if (overlayTimeout) {
-        clearTimeout(overlayTimeout);
-      }
-    }
-  }, [props.loading, dispatch])
-
-  // Grid status Trigger
-  useEffect( () => {
-    if (status && !props.loading && dataLoaded ) {
-      hideOrShowOverlay();
-    }
-  },[status, props.loading]);
-
-  // Print Grid Trigger
-  useEffect( () => {
-    if (printGrid ) {
-     onPrint();
-    }
-  },[printGrid, onPrint]);
-
-  // trigger to detect change in gridOptions
-  // if export request present then update data w/o materDetail if present
-  useEffect( () => {
-    if (gridApi && exportGrid.gridExporting) {
-      submitExportRequest(exportGrid.type);
-    }
-  },[gridOptions, exportGrid.gridExporting, exportGrid.type, gridApi, submitExportRequest]);
-
-
- // check if Outside Filter has been defined
-  useEffect( () => {
-    if (props.gridOptions && props.noFilterCheck && !props.loading) {
-      // Does the grid need to Filter?
-      props.gridOptions.isExternalFilterPresent =() => {
-        // if status is not ALL, then we are filtering
-        if (props.noFilterCheck) {
-          return props.noFilterCheck(gFilter.current);
-        }
-       return false;
-        // return gFilter.current !== props.filterOptions?.isGridFiltered;
-      };
-      props.gridOptions.doesExternalFilterPass = (node: RowNode) => {
-        if (props.gridFilter) {
-          return props.gridFilter(node, gFilter.current);
-        }
-        return true;
-      }
-    }
-  },[props.noFilterCheck, props.gridFilter, props.gridOptions]);
-
-  // Has external filter value changed?
-  useEffect( () => {
-    const api: GridApi = gridApi as unknown as GridApi;
-    if (api && !api.getModel().isEmpty() && !props.loading) {
-      gFilter.current = props.filterValue;
-      (gridApi as unknown as GridApi).onFilterChanged();
-    }
-  },[props.filterValue, gridApi])
-
-  // User typed in values for a quick search on Grid
-  useEffect( () => {
-   if (gridApi && props.searchFilter !== null) {
-      (gridApi as any).setQuickFilter(props.searchFilter);
-   }
-  },[props.searchFilter])
-
-  // Watch flyout for pagination change.
-  // Adjust page if selected trxn is the last row on page.
-  useEffect(() => {
-    setTimeout( () => {
-      const selectedNodes = gridOptions.api?.getSelectedNodes();
-      if (selectedNodes && selectedNodes.length) {
-        const lastSelection: RowNode = selectedNodes[selectedNodes.length-1];
-        gridOptions.api?.ensureIndexVisible(lastSelection.rowIndex, 'bottom');
-      }
-    }, 200)
-  },[props.resizeCheck])
-
-  const isLocalColPrefs = (): boolean => {
-    // does user have userDefined columnDefinitions in localStorage?
-    const localPrefsName: string = (props.localStorageName) ? props.localStorageName.toString() : '';
-    const userPrefStorage: any = localStorage.getItem('COLUMN_PREFERENCES_' + localPrefsName);
-    const columnDefs: ColDef[] | undefined = props.gridOptions.columnDefs;
-    const userColPreferences = JSON.parse(userPrefStorage);
-    let columnChanged = !userColPreferences;
-    if ((columnDefs !== undefined && userColPreferences && userColPreferences.length && props.gridOptions.columnApi)) {
-
-        const colApi: ColumnApi = props.gridOptions.columnApi;
-        /*
-        * If colDef defines the column as locked and the column position is different from the user preference, then
-        * local preferences will be overridden.
-        * */
-          _.forEach(userColPreferences, (column: ColumnState, index: number) => {
-            if (column.pinned) { // prevent pinning
-              column.pinned = false;
-            }
-            else {
-              const columnDef = _.find(columnDefs, {field: column.colId})
-              if (!columnDef) {
-                columnChanged = true;
-              } else if ((columnDef.lockPosition || columnDef.lockVisible) && (((columnDef.hide || column.hide === true) && column.hide !== columnDef.hide) ||
-                column.colId !== columnDefs[index].field)) {
-                  columnChanged = true;
-              }
-            }
-          });
-
-        if (!columnChanged) {
-          /* * The section of code below is needed to make sure the default sorting is used when a column state
-           * loads in from local storage.
-           * */
-          _.forEach(colApi.getColumnState(), (column: any) => {
-            for (const columnOfColumnPreferences of userColPreferences) {
-              if (column.colId === columnOfColumnPreferences.colId) {
-                columnOfColumnPreferences.sort = column.sort;
-                columnOfColumnPreferences.sortIndex = column.sortIndex;
-              }
-            }
-          });
-          props.gridOptions.columnApi?.setColumnState(userColPreferences);
-        }
-      }
-    return columnChanged;
-  }
-
-  const onGridReady = (params: any) => {
-    const api: GridApi = params.api;
-    const colApi = params.columnApi;
-    if (api) {
-      setGridApi( api);
-      setColumnApi(colApi);
-      if (props.localStorageName) {
-        const sizeColumnsToFit = isLocalColPrefs();
-        if (sizeColumnsToFit) {
-          api.sizeColumnsToFit();
-        }
-      }
-    }
-  };
-
-  // Note: Removed getSelectedRows() because the grid adds the rows in its array in the order they appear on the grid.
-  // We do not want the user to see the transactions in the order they selected when it comes to the flyout. Because
-  // of that, we decided to take control away from the grid when it comes to adding to the selectedAlerts array.
-  const onRowSelected = (event: SelectionChangedEvent) => {
-   // const data: any = _.clone(event.node.data);
-    const selRows: any[] = [];
-    // Keeping track of selected ids to determine order of selection
-    let selectedIdsArray: any[]  = _.cloneDeep(selectedIds);
-    const pageCount: number | undefined = gridOptions.api?.paginationGetRowCount();
-    const selNodes: RowNode[] = event.api.getSelectedNodes();
-    const headerSelected = pageCount === selNodes.length;
-
-    if (!selNodes.length && selectedIds.length) {
-      // SelectAll un-checked
-      setSelectedIds([]);
-      dispatch(updateSelectedRows([], false));
-    }
-    else if (headerSelected && selectedIds.length !== selNodes.length) {
-      // SelectAll Checked
-      selectedIdsArray = [];
-      // SelectedNodes doesnt always have nodes in correct order so need to sortBy rowIndex first
-      const sortedSelNodes: RowNode[] = _.sortBy(selNodes,['rowIndex']);
-      _.forEach(sortedSelNodes,(node: RowNode) => {
-        // select the node
-        selectedIdsArray.push(node.id);
-        selRows.push(node.data);
-      });
-      setSelectedIds(selectedIdsArray);
-      dispatch(updateSelectedRows(selRows, headerSelected));
-    } else if (!headerSelected && selNodes.length) {
-        // selectAll NOT checked - checked selectedNodes against order of selectedIds
-        const listOfIds: any = _.keyBy(selNodes,'id');
-        // add any new rows
-        const listOfIdsArray: string[] = [];
-        _.forEach(_.keys(listOfIds), (id: string) => {
-          listOfIdsArray.push(id);
-          if (selectedIdsArray.indexOf(id) < 0) {
-            selectedIdsArray.push(id);
-          }
         });
-        const idsToRemove = _.difference(selectedIdsArray, listOfIdsArray);
-        // remove any un-selected
-        _.forEach(idsToRemove, (id: string) => {
-          const idx = selectedIdsArray.indexOf(id);
-          selectedIdsArray.splice(idx, 1);
-        })
-        if (selectedIdsArray.length) {
-          // get selectedAlerts from ID's in state to ensure order of selection
-          _.forEach(selectedIdsArray, (id: string) => {
-            const node = _.find(selNodes,{id});
-            if (node) {
-              selRows.push(node.data);
-            }
-          });
-        }
 
-     // setSelectedRows(selRows);
-      setSelectedIds(selectedIdsArray);
-      dispatch(updateSelectedRows(selRows || [], headerSelected));
     }
-    else {
-      dispatch(updateSelectedRows(selRows || [], headerSelected));
+  }
+
+  const closeSubmit = (reset: boolean) => {
+  if (!detailsPanelOpen) {
+    if(reset) {
+      setRefreshFilters(true);
+      dispatch(loadPayments());
+      displayBannerIfSuccess();
     }
+    setIsSubmitClicked(false);
+  }
+  else if (detailsPanelOpen) {
+    if (reset) {
+      refreshPayments();
+      displayBannerIfSuccess();
+    }
+    setIsSubmitClicked(false)
+  }
 
   };
 
- const onFilterChanged = () => {
-    if (!props.loading && dataLoaded) {
-      hideOrShowOverlay()
-    }
+  const refreshPayments = () => {
+    dispatch(loadPayments(undefined, true));
   }
 
-  const onRowDataChanged = () => {
-    if (!props.loading && dataLoaded) {
-      hideOrShowOverlay()
-    }
-  }
+  const displayBannerIfSuccess = () => {
 
-  const onRowDataUpdated = () => {
-    if (!props.loading && dataLoaded) {
-      hideOrShowOverlay()
-    }
-  }
-
-  const hideOrShowOverlay = () => {
-    if (gridOptions && gridOptions.api) {
-      gridOptions.api.hideOverlay();
-      if (props.loading) {
-        gridOptions.api.showLoadingOverlay();
-      }
-      else if (status === PCCMessages.NO_GRID_DATA || status === PCCMessages.PCC_GRID_API_ERROR) {
-        gridOptions.api.showNoRowsOverlay();
+    if (bannerOptions.type === BannerDisplayTypes.SUCCESS) {
+      // if showBanner already true, need to reset it back to false and then show again.
+      if (showBanner) {
+        setBanner(false);
+        setTimeout(() => {
+          setBanner(true);
+        },200)
       }
       else {
-        // Had data prior but does not now
-        if (dataInFilter && gridOptions.api.getDisplayedRowCount() === 0 ) {
-          setDataInFilter(false);
-          gridOptions.api.showNoRowsOverlay();
-        }
-        else if (!dataInFilter) {
-          if (gridOptions.api.getDisplayedRowCount() > 0) {
-            // Had no data prior but has data now
-            setDataInFilter(true);
-          }
-          else if (gridOptions.api.getDisplayedRowCount() === 0 && status) {
-            // Had no data prior, has no data now, and has a status. This is needed due overlay disapearing if update
-            // row data or set row data occurs
-            gridOptions.api.showNoRowsOverlay();
-          }
-        }
-        if (props.rowUpdateCallback) {
-          props.rowUpdateCallback(gridOptions.api);
-        }
+        setBanner(true);
       }
     }
   }
 
-  const getGeneralMenuItems = (params: any) => {
-    return [
-      {name : t('columnMenu.autoSizeThis'),
-        action: () => {
-          if (gridOptions && gridOptions.columnApi) {
-            gridOptions.columnApi?.autoSizeColumn(params.column);
-          }
-        }
-      },
-      {name : t('columnMenu.autoSizeAll'),
-        action: () => {
-          if (gridOptions && gridOptions.columnApi) {
-            gridOptions.columnApi.autoSizeAllColumns();
-          }
-        }
-      },
-      {
-        name: t('columnMenu.ResetSizeAll'),
-        action: () => {
-          params.api.sizeColumnsToFit();
-        }
-      }
-    ]
+  const hideBanner = () => {
+    setBanner(false);
+    if (bannerOptions.type === BannerDisplayTypes.SUCCESS) {
+      dispatch(submitAlertsReset())
+    }
+  };
+
+  const hideBannerNoReset = () => {
+    setBanner(false);
   }
 
-  const saveColumnState = () => {
-    const columnDefs: ColDef[] | undefined = gridOptions.columnDefs;
-    if (columnDefs !== undefined && props.localStorageName) {
-      const columnStateLocalVar = gridOptions.columnApi?.getColumnState();
-      const columnPreferencesLocalVariable = localStorage.getItem('COLUMN_PREFERENCES_'
-        + props.localStorageName.toString());
-      if (columnStateLocalVar && columnStateLocalVar !== [] ) {
-        if (columnPreferencesLocalVariable === null) {
-          localStorage.setItem('COLUMN_PREFERENCES_' +
-            props.localStorageName.toString(), JSON.stringify(columnStateLocalVar));
-        } else if (columnPreferencesLocalVariable !== JSON.stringify(columnStateLocalVar)) {
-          localStorage.setItem('COLUMN_PREFERENCES_' +
-            props.localStorageName.toString(), JSON.stringify(columnStateLocalVar));
-        }
-      }
+  const toggleDetailsPanel = (resetFlyout?: boolean) => {
+    if(resetFlyout) {
+      dispatch(changeDetailsPanelStatus(false))
+    } else {
+      dispatch(changeDetailsPanelStatus(!detailsPanelOpen))
+    }
+    if (detailsPanelOpen) {
+      gridOptions.api?.refreshClientSideRowModel('sort');
+      dispatch(changeFlyoutRecord(null))
     }
   }
 
-  const onColumnVisible = () => {
-   saveColumnState();
+  const getMetaData = (data: any) => {
+    return createMetadata(data.txnData, t, userPreferences)
   }
 
-  const onColumnResized = () => {
-    saveColumnState();
+  const exportCallback = (exportAlerts: ISelectedAlerts[], exportOptions: GridExportTypes) => {
+
+    const _metaDataArray = [];
+    let metaData;
+    for (const data of exportAlerts) {
+      metaData = getMetaData(data)
+      _metaDataArray.push(metaData)
+    }
+    exportFlyoutData(exportOptions, _metaDataArray, t)
+    dispatch(exportFlyoutComplete())
   }
 
-  const onDragStopped = (event: DragStoppedEvent) => {
+  /*------------------------Section: useCallbacks -----------------------------*/
+  /*------------------------Section: useEffects -----------------------------*/
+  useEffect( () => {
+    if (gridOptions.api && alertsData.length && SecurityCenterMessages.UNUSUAL_TRANSACTION_FETCH_SUCCESS === alertsMsg) {
+      let sortModel: ColumnState[] | undefined;
+      if (refreshFlag) {
+        // manual refresh triggered - retain sort model
+        sortModel = gridOptions.columnApi?.getColumnState();
+      }
+      gridOptions.api.setRowData(alertsData);
+      if (refreshFlag) {
+        // if manual refresh re-apply sortModel after data update
+        gridOptions.columnApi?.applyColumnState({
+          state: sortModel
+        })
+        setRefreshFilters(true);
+        setRefreshFlag(false);
+      }
+    }
+  },[gridOptions, alertsData]);
 
-    if (event.columnApi) {
-      const cols = event.columnApi.getColumnState();
-      _.forEach(cols, (col: ColumnState) => {
-         col.pinned = null; // prevent pinning
+
+  useEffect( () => {
+    if (  currentTab  === PCCTabs.ALERTS && environment ) {
+      gridReloadCallback()
+    }
+  },[currentTab, environment]);
+
+
+  useEffect( () => {
+    dispatch(updateSelectionCounts(selectedAlerts));
+    if (gridOptions.api && selectedAlerts.length > 0 && alertsData.length > 0) {
+      if (showBanner && !detailsPanelOpen) {
+        hideBanner()
+      }
+      const currSelRows = gridOptions.api.getSelectedRows();
+      // Select any nodes in the grid that are in selectedAlerts array
+      gridOptions.api.forEachNode( (node: RowNode) => {
+        const foundAlert: IAlertData | undefined = findAlert(selectedAlerts, node.data);
+        if (foundAlert && (!node.isSelected() || _.find(currSelRows,{id: node.id}))) {
+          node.setSelected( true);
+          if (foundAlert && foundAlert.status !== node.data.status) {
+            node.setData(foundAlert);
+          }
+        }
+      });
+      gridOptions.api?.refreshClientSideRowModel('filter');
+
+    } else if (gridOptions.api) {
+      gridOptions.api.onSortChanged();
+      if (refreshFilters) {
+        setRefreshFilters(false);
+      }
+
+    }
+
+  },[selectedAlerts, alertsData]);
+
+  useEffect( () => {
+    if (submitStatus.countSuccessful === submitStatus.totalCount && submitStatus.countSuccessful !== 0) {
+      setIsSubmitClicked(false);
+    }
+    else if (showBanner && submitStatus.status !== BannerDisplayTypes.SUCCESS && ((submitStatus.totalCount !== 0 &&
+      submitStatus.countSuccessful !== submitStatus.totalCount) ||
+      (submitStatus.statusCode !== "" && submitStatus.statusCode !== null))) {
+      // If the current banner still exists and a new persistent banner exists
+      hideBannerNoReset();
+    }
+  },[submitStatus]);
+
+
+  useEffect( () => {
+    if (gridOptions.api && detailsPanelOpen) {
+      const api = gridOptions.api;
+      const gridSelNodes: RowNode[] = api.getSelectedNodes();
+      _.forEach(gridSelNodes, (node: RowNode) => {
+        const foundAlert = findAlert(selectedAlerts, node.data);
+        if (foundAlert && foundAlert.status !== node.data.status) {
+          node.setData(foundAlert);
+        }
       })
-      event.columnApi?.setColumnState(cols);
     }
-    saveColumnState();
+  },[currentRecord, selectedAlerts]);
 
-  }
+
+  useEffect(() => {
+    if (bannerOptions.message && bannerOptions.type === BannerDisplayTypes.SUCCESS) {
+      closeSubmit(true)
+    }
+    else if (bannerOptions.message && bannerOptions.type === BannerDisplayTypes.INFO) {
+      setBanner(true)
+    }
+    else if (bannerOptions.message === '' && bannerOptions.type === BannerDisplayTypes.INFO && showBanner) {
+      setBanner(false)
+    }
+  },[bannerOptions.message]);
+
   return (
-    <DataGridContainer>
+    <AlertsContainer   data-testid={'pcc-alerts'}  >
+      <AlertsBanner show={showBanner}  options={bannerOptions} onCloseCallback={hideBanner}/>
+      <AlertsBox>
+        <GridContainer>
+          <PCCHeaderLayout justify="space-between" container={true}>
+            <PCCTitleBox>
+              {t('alertsTitle')}
+            </PCCTitleBox>
+            <ColumnLayout item={true}>
+              <GridTools refreshCallback={gridReloadCallback}
+                         disableGridTools={disableGridTools}
+                         disableGridToolsNoDataInFilter={disableGridToolsNoData}
+                         tools={gridTools} />
+            </ColumnLayout>
+          </PCCHeaderLayout>
+          <GridWrapper $printing={isGridPrinting}>
+            <FilterGrid  gridOptions={gridOptions}
+                         reloadCallback={gridReloadCallback}
+                         resizeCheck={detailsPanelOpen}
+                         updateFilters={refreshFilters}
+                         disableGridTools = {disableGridTools}
+                         disableGridToolsNoDataInFilter = {disableGridToolsNoData}
+                         rowUpdateCallback = {rowUpdateCallback}
+                         timelyRefresh = {true}
+                         localStorageName = {LocalStorageName.ALERTS}/>
+          </GridWrapper>
+          <GridFooterWrapper>
+            { (alertsData.length && !loadingAlerts) ? (
+              <ActionsToolbar
+                onActionCallback={actionOnRecords}
+                disabledActions={disabledActions}
+                showSelections={ToolbarSelectionState.PENDING_AND_SELECTIONS}
+                tools={actionTools}
+              />
+            ) : (<div/>)
+            }
+          </GridFooterWrapper>
+        </GridContainer>
 
-        <DataGrid
-          className={classnames(props.classes.pccGrid, props.className, printGrid ? props.classes.dataGridPrint : null)}
-          style={{ height: `100%` }}
-          excelStyles={excelStyles}
-          gridOptions ={gridOptions}
-          rowSelection={props.rowSelection ? props.rowSelection : 'multiple'}
-          onSelectionChanged={props.rowSelection === PccRowSelection.NONE ? undefined : onRowSelected}
-          rowMultiSelectWithClick={true}
-          suppressCellSelection = {false}
-          suppressRowClickSelection = {false}
-          density={gridDensity}
-          onRowDataChanged = {onRowDataChanged}
-          onFilterChanged = {onFilterChanged}
-          onRowDataUpdated = {onRowDataUpdated}
-          onGridReady={onGridReady}
-          onColumnVisible = {onColumnVisible}
-          onColumnResized = {onColumnResized}
-          onDragStopped = {onDragStopped}
-          pagination={props.pagination !== undefined ? props.pagination : true}
-          paginationAutoPageSize={(props.gridOptions.paginationPageSize !== undefined) ? false :true}
-          pager={CustomPagingDisplay}
-          frameworkComponents={frameworkComponents}
-          loadingOverlayComponent='customLoadingOverlay'
-          noRowsOverlayComponent='customNoRowsOverlay'
-          noRowsOverlayComponentParams={noRowsOverlayParams}
-          suppressContextMenu = {true}
-          getMainMenuItems = {getGeneralMenuItems}
-        />
-    </DataGridContainer>
-  )
-};
+        <FlyoutPanel
+          data={selectedAlerts}
+          onCloseCallback={toggleDetailsPanel}
+          showNavigation={true}
+          open={detailsPanelOpen}
+          exportCallback = {exportCallback}
+          actionToolbar = {{onActionCallback : actionOnRecords, disabledActions: disabledFlyoutActions, tools: flyoutActionTools }}
+          onCloseSubmitCallback = {closeSubmit}>
+          <FlyoutHeader><AlertsHeaderDetails/></FlyoutHeader>
+          <FlyoutContent><DataDetail metaDataCallback= {getMetaData}/></FlyoutContent>
+        </FlyoutPanel>
+      </AlertsBox>
 
+      <SubmitActionManager activate={isSubmitClicked} onClose={closeSubmit}/>
+    </AlertsContainer>
+  );
 
-const gridStyles =({palette}: Theme) => createStyles({
-  pccGrid: {
-    flex: 1,
-    '& .ag-pinned-left-cols-viewport': {
-      overflowX: 'scroll!important'
-    },
-    '& .ag-cell .ag-cell-wrapper .ag-row-group-leaf-indent': {
-      marginLeft: '16px'
-    },
-    '& .ag-cell .ag-cell-wrapper .ag-group-contracted span.ag-icon-expanded': {
-      marginRight: '5px'
-    },
-    '& .ag-cell .ag-cell-wrapper .ag-group-expanded span.ag-icon-expanded': {
-      marginRight: '5px'
-    },
-    '& .history-detail  .ag-root-wrapper' : {
-      background: palette.toolkit.grey10
-    },
-    '& .history-detail .ag-header-viewport': {
-      background: palette.toolkit.grey10,
-      borderBottom: '1px solid #000'
-    },
-    '& .history-detail .ag-header': {
-      background: palette.toolkit.grey10,
-      borderBottom: '#000'
-    },
-    '& .history-detail .ag-header-cell': {
-      background:palette.toolkit.grey10
-    },
-    '& .ag-header-cell-label .ag-header-icon.ag-sort-order': {
-      display: 'none'
-    },
-    '& .history-detail .ag-row': {
-      borderBottom: '1px solid #cdcaca',
-      background:palette.toolkit.grey10
-    },
-    '& .history-detail .ag-row.ag-row-hover': {
-      background:palette.toolkit.grey10
-    },
-    '& .history-detail .ag-header-cell:hover': {
-      background:palette.toolkit.grey10
-    },
-    '& .history-detail .ag-row:last-child': {
-      borderBottom: 'none'
-    },
-    '& .ag-column-select-header-checkbox': {
-      display: 'none'
-    },
-    '& .ag-body-viewport.ag-layout-normal': {
-      overflowY: 'auto'
-    }
-  },
-  // this would normally be under a print media query but the grid need to
-  // calculate based on styles before the print dialogue is opened
-  dataGridPrint: {
-    // this should be taken care of with setting density but the value is
-    // hardcoded in Toolkit data-grid for header cells, so we have to set
-    // it here, in addition to changing density on the grid
-    '&.ag-theme-material .ag-header': {
-      fontSize: 9
-    },
-    height: 'auto',
-    maxWidth: '290mm'
+}
+
+const style = () => createStyles({
+  drawerOpen: {
+    'width': '500px',
+    'display': 'flex',
+    'flex': '1',
+    'position': 'absolute',
+    'top': '0',
+    'right': '0',
+    'height': '100%',
+    'flexDirection': 'column'
   }
 });
 
-const DataGridContainer = styled.div`
+
+export const AlertsContainer = styled.div`
+    width: 100%;
+    height: 100%;
+    flex-direction: column;
+    display: flex;
+ `;
+
+export const AlertsBox = styled.div`
   display: flex;
-  flex: 1;
-  flex-direction: column;
-  margin-top: 10px;
-  padding: 10px 0px;
+  flex-direction: row;
+  flex: 1 1 auto;
   position: relative;
-  border-style: solid;
-  border-width: 1px 0px;
-  border-color: #ccc;
-  z-index: 0;
 `;
 
+export const GridContainer = styled.div`
+   height: 100%;
+   display: flex;
+   flex-direction: column;
+   padding: 0px;
+   flex: 1
+`;
 
-export default withStyles(gridStyles)(PCCGrid);
+const  FlyoutPanelWrapper = styled(Panel)`
+  display: flex;
+    flex: 0 510px;
+    height: 100%;
+    flex-direction: column;
+    border-left: 2px solid #ccc;
+    padding: 0;
+`;
+
+export const GridFooterWrapper = styled(Panel)`
+    padding: 15px 0px;
+    height: max-content;
+    display: flex;
+`;
+
+const GridWrapper= styled(Panel)<{$printing: boolean}>`
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    padding: 0px;
+    maxWidth: ${props => props.$printing ? '290mm': 'inherit'}
+`;
+
+const PCCHeaderLayout = styled(ColumnLayout)`
+    margin-top: ${props => `${props.theme.spacing(5)}px`};
+    margin-bottom: ${props => `${props.theme.spacing(2)}px`};
+`;
+
+export default withStyles(style)(Alerts);
